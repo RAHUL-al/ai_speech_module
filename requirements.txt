@@ -1,0 +1,17 @@
+fastapi==0.116.0
+FastAPI_SQLAlchemy==0.2.1
+langchain_google_genai==2.1.6
+passlib==1.7.4
+pydantic==2.11.7
+pydub==0.25.1
+python-dotenv==1.1.1
+python_jose==3.5.0
+redis==6.2.0
+Requests==2.32.4
+soundfile==0.13.1
+SQLAlchemy==2.0.41
+torch==2.7.1
+torchaudio==2.7.1
+transformers==4.53.1
+ujson==5.10.0
+uvicorn==0.35.0
