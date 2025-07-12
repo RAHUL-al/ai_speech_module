@@ -7,18 +7,21 @@ import requests
 import os
 from models import Essay
 from fastapi_sqlalchemy import db
-import torch
 import torchaudio
-from transformers import AutoModelForAudioClassification, AutoFeatureExtractor
+from transformers import AutoModelForAudioClassification, AutoFeatureExtractor, AutoModelForCausalLM, AutoTokenizer
 import torch.nn.functional as F
 from datetime import datetime
 import asyncio
 import threading
-from langchain.vectorstores import Pinecone
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.chains import RetrievalQA
-from langchain.llms import OpenAI
-import pinecone
+from gector.modeling import GECToR
+from gector.predict import predict, load_verb_dict
+from kokoro import KPipeline
+from IPython.display import display, Audio
+import soundfile as sf
+from pydub import AudioSegment
+import re
+from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
+import numpy as np
 
 load_dotenv()
 
@@ -28,46 +31,14 @@ class Topic:
         self.total_pronunciation = 0.0
         self.total_emotion = {}
         self.chunk_count = 0
-        self.vector_index = self.init_vector_database()
-        self.embedding_fn = OpenAIEmbeddings()
-
-
-    def init_vector_database(self):
-        pinecone.init(
-            api_key=os.getenv("PINECONE_API_KEY"),
-            environment=os.getenv("PINECONE_ENV")
-        )
-        index_name = "student-essays"
-        if index_name not in pinecone.list_indexes():
-            pinecone.create_index(index_name, dimension=1536)
-        return pinecone.Index(index_name)
-    
-
-    def index_essay_for_chat(self, essay: Essay, username: str):
-        from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        chunks = text_splitter.split_text(essay.content)
-        metadatas = [{
-            "username": username,
-            "essay_id": essay.id,
-            "student_class": essay.student_class,
-            "topic": essay.topic,
-        } for _ in chunks]
-
-        Pinecone.from_texts(chunks, self.embedding_fn, index_name="student-essays", metadatas=metadatas)
-
-    def rag_chat(self, query_text: str, username: str):
-        vectordb = Pinecone.from_existing_index(
-            index_name="student-essays",
-            embedding=self.embedding_fn,
-            filter={"username": username}
+        model_name = "Qwen/Qwen3-0.6B"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype="auto",
+            device_map="auto"
         )
 
-        retriever = vectordb.as_retriever(search_kwargs={"k": 3})
-        qa = RetrievalQA.from_chain_type(llm=OpenAI(model="gpt-3.5-turbo"), chain_type="stuff", retriever=retriever)
-        response = qa.run(query_text)
-        return response
 
     def reset_realtime_stats(self):
         self.total_fluency = 0.0
@@ -99,33 +70,49 @@ class Topic:
             "emotion": dominant_emotion
         }
 
-    def topic_data_model_for_Qwen(self,username: str, prompt: str) -> str:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": "qwen/qwen1.5-14b-chat",
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.7
-        }
-
+    def topic_data_model_for_Qwen(self, username: str, prompt: str) -> str:
         try:
-            response = requests.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            result = response.json()
-            text_output = result["choices"][0]["message"]["content"]
-            threading.Thread(target=self.text_to_speech, args=(text_output,username), daemon=True).start()
-            return text_output
+            model_name = "Qwen/Qwen3-0.6B"
+
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype="auto",
+                device_map="auto"
+            )
+
+            messages = [
+                {"role": "user", "content": prompt}
+            ]
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False
+            )
+            model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+            generated_ids = model.generate(
+                **model_inputs,
+                max_new_tokens=32768
+            )
+            output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist() 
+
+            try:
+                index = len(output_ids) - output_ids[::-1].index(151668)
+            except ValueError:
+                index = 0
+
+            content = tokenizer.decode(output_ids[index:], skip_special_tokens=True)
+
+            threading.Thread(target=self.text_to_speech, args=(content, username), daemon=True).start()
+
+            return content
 
         except Exception as e:
             print(f"[Qwen API Error] {e}")
             return "Qwen model failed to generate a response."
+
 
 
     async def detect_emotion(self, audio_path):
@@ -170,33 +157,83 @@ class Topic:
 
         return f"{score:.2f}"
 
-    async def pronunciation_scoring(self, audio_path):
+    async def silvero_vad(self, audio_path):
         return await asyncio.to_thread(self._pronunciation_score_sync, audio_path)
+    
+    def _silvero_vad_sync(self,audio_path):
+        model_path="silero_vad/silero-vad/src/silero_vad/data/silero_vad.jit"
+
+        model = torch.jit.load(model_path)
+        model.eval()
+
+        wav, sr = torchaudio.load(audio_path)
+
+        if wav.shape[0] > 1:
+            wav = torch.mean(wav, dim=0, keepdim=True)
+
+        if sr != 16000:
+            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
+            wav = resampler(wav)
+
+        wav = wav / wav.abs().max()
+        wav = wav.squeeze()
+
+        SAMPLE_RATE = 16000
+        WINDOW_SIZE = 512
+        HOP_SIZE = 160
+        THRESHOLD = 0.3
+
+        speech_segments = []
+
+        for i in range(0, len(wav) - WINDOW_SIZE + 1, HOP_SIZE):
+            chunk = wav[i:i + WINDOW_SIZE].unsqueeze(0)
+            
+            with torch.no_grad():
+                try:
+                    prob = model(chunk, SAMPLE_RATE).item()
+                except Exception as e:
+                    print(f"Skipping chunk due to error: {e}")
+                    continue
+
+            label = "Speech" if prob > THRESHOLD else "Silence"
+            time = i / SAMPLE_RATE
+            speech_segments.append((time, label, prob))
+
+        return [seg for seg in speech_segments if seg[1] == "Speech"]
+
+        async def pronunciation_scoring(self, audio_path):
+            return await asyncio.to_thread(self._pronunciation_score_sync, audio_path)
+
+    
 
     def _pronunciation_score_sync(self, audio_path):
-        from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2ForSequenceClassification
         feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-large-xlsr-53")
-        model = Wav2Vec2ForSequenceClassification.from_pretrained("hafidikhsan/wav2vec2-large-xlsr-53-english-pronunciation-evaluation-aod-real")
-        speech_array, sampling_rate = torchaudio.load(audio_path)
+        model = Wav2Vec2ForSequenceClassification.from_pretrained(
+            "hafidikhsan/wav2vec2-large-xlsr-53-english-pronunciation-evaluation-aod-real"
+        )
+
+        speech_array, sampling_rate = torchaudio.load("harvard.wav")
+
+        if speech_array.shape[0] > 1:
+            speech_array = torch.mean(speech_array, dim=0, keepdim=True)
+
         if sampling_rate != 16000:
             resampler = torchaudio.transforms.Resample(orig_freq=sampling_rate, new_freq=16000)
             speech_array = resampler(speech_array)
 
         inputs = feature_extractor(speech_array.squeeze(), sampling_rate=16000, return_tensors="pt")
+
         with torch.no_grad():
             logits = model(**inputs).logits
 
         scores = torch.softmax(logits, dim=-1)
         return f"{scores[0][1].item():.2f}"
+    
 
     async def grammar_checking(self, spoken_text, original_text):
         return await asyncio.to_thread(self._grammar_check_sync, spoken_text, original_text)
 
     def _grammar_check_sync(self, spoken_text, original_text):
-        from gector.modeling import GECToR
-        from transformers import AutoTokenizer
-        from gector.predict import predict, load_verb_dict
-
         model_id = "gotutiyan/gector-roberta-base-5k"
         model = GECToR.from_pretrained(model_id)
 
@@ -243,7 +280,6 @@ class Topic:
 
         original_text = latest_essay.content
 
-        # Run evaluations in parallel
         pronunciation_task = self.pronunciation_scoring(audio_path)
         fluency_task = self.fluency_scoring(spoken_text)
         emotion_task = self.detect_emotion(audio_path)
@@ -315,13 +351,6 @@ class Topic:
             return ""
         
     def text_to_speech(self, text_data, username):
-        from kokoro import KPipeline
-        from IPython.display import display, Audio
-        import soundfile as sf
-        import torch
-        from pydub import AudioSegment
-        import re
-
         output_dir = os.path.join("text_to_speech_audio_folder", username)
         os.makedirs(output_dir, exist_ok=True)
 
@@ -368,19 +397,3 @@ class Topic:
                 print(f"Error deleting file: {file} - {e}")
 
         return output_path
-
-
-    def speech_to_text_and_rag_chat(self, username: str):
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        audio_path = os.path.join("audio_folder", username, date_str, f"{username}_output.wav")
-
-        if not os.path.exists(audio_path):
-            return {"error": f"Audio file not found at {audio_path}"}
-
-        spoken_text = self.speech_to_text(audio_path)
-        if not spoken_text:
-            return {"error": "Failed to transcribe speech."}
-
-        response = self.rag_chat(spoken_text, username)
-        return {"spoken_text": spoken_text, "rag_response": response}
-

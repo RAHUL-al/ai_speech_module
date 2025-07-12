@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
 from models import User, Essay
 from schemas import UserCreate, UserOut, UserUpdate, Token, LoginRequest, ForgotPasswordRequest, GeminiRequest, TextToSpeechRequest
-from ai_speech_module import Topic as AiTopic
+from ai_speech_module import Topic as Topic
 from auth import hash_password, verify_password, create_access_token
 from dotenv import load_dotenv
 from urllib.parse import parse_qs
@@ -16,14 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from fastapi.responses import FileResponse
 import time
-from google.cloud import vision
-import pinecone
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.vectorstores import Pinecone
-from langchain.llms import OpenAI
-from langchain.chains import RetrievalQA
-from typing import List
+import re
+from fastapi import FastAPI, UploadFile, File, Form
+import shutil, os
 
 executor = ThreadPoolExecutor(max_workers=4)
 
@@ -40,8 +35,8 @@ redis_client = redis.StrictRedis(
 )
 
 origins = [
-    "http://localhost:5173",
-    "https://02d59704d602.ngrok-free.app",
+    "http://localhost:3000",
+    "http://43.205.138.222/",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -143,11 +138,11 @@ def forgot_password(request: ForgotPasswordRequest):
 def generate_prompt(data: GeminiRequest, user=Depends(get_user_from_redis_session)):
     prompt = (
         f"Generate a essay for a student in class {data.student_class} "
-        f"with a {data.accent} accent, on the topic '{data.topic}', and the mood is '{data.mood}' and give me essay less than 400 words."
+        f"with a {data.accent} accent, on the topic '{data.topic}', and the mood is '{data.mood}' and give me essay less than 800 words and in response did not want \n\n or \n and also not want word count thanks you this type of stuff."
     )
     username = user.get("username")
-    topic = AiTopic()
-    response_text = topic.topic_data_model_for_Qwen(prompt, username=username)
+    topic = Topic()
+    response_text = topic.topic_data_model_for_Qwen(username, prompt)
 
     essay = Essay(
         student_class=data.student_class,
@@ -160,7 +155,6 @@ def generate_prompt(data: GeminiRequest, user=Depends(get_user_from_redis_sessio
     db.session.add(essay)
     db.session.commit()
     db.session.refresh(essay)
-
     return {"response": response_text, "essay_id": essay.id}
 
 TEMP_DIR = os.path.abspath("audio_folder")
@@ -181,7 +175,7 @@ async def audio_ws(websocket: WebSocket):
     chunk_index = 0
     chunk_files = []
     text_output = []
-    topic = AiTopic()
+    topic = Topic()
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     user_dir = os.path.join(TEMP_DIR, username, date_str)
@@ -216,19 +210,20 @@ async def audio_ws(websocket: WebSocket):
                 audio.export(chunk_filename, format="wav")
                 chunk_files.append(chunk_filename)
 
-                # Real-time parallel processing
                 results = await asyncio.gather(
                     asyncio.to_thread(topic.speech_to_text, chunk_filename),
-                    asyncio.to_thread(topic.analyze_emotion, chunk_filename),
-                    asyncio.to_thread(topic.analyze_fluency, chunk_filename),
-                    asyncio.to_thread(topic.analyze_pronunciation, chunk_filename),
+                    topic.detect_emotion(chunk_filename),
+                    topic.fluency_scoring(chunk_filename),
+                    topic.pronunciation_scoring(chunk_filename),
+                    topic.silvero_vad(chunk_filename)
                 )
 
-                transcribed_text, emotion, fluency, pronunciation = results
+                transcribed_text, emotion, fluency, pronunciation, vad_segments = results
 
                 text_output.append(transcribed_text)
                 print(f"[Chunk {chunk_index}] Transcribed: {transcribed_text.strip()}")
                 print(f"Emotion: {emotion} | Fluency: {fluency} | Pronunciation: {pronunciation}")
+                print(f"Silero VAD Segments: {len(vad_segments)} detected speech windows")
                 chunk_index += 1
 
     except WebSocketDisconnect:
@@ -260,7 +255,7 @@ async def merge_chunks(chunk_files, final_output):
 @app.get("/grammar-score")
 def grammar_score(username: str):
     try:
-        service = AiTopic()
+        service = Topic()
         result = service.overall_scoring(username=username)
         return result
     except Exception as e:
@@ -289,109 +284,27 @@ def get_tts_audio(username: str):
     raise HTTPException(status_code=408, detail="Audio file not generated within 1 minute.")
 
 
+
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...), student_class: str = Form(...), subject: str = Form(...)):
+    folder = f"uploads/{student_class}/{subject}"
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, file.filename)
+    with open(path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    return {"filepath": path}
+
+
+
 @app.get("/test")
 def welcome_page():
     return {"Message": "Welcome the ai speech module page."}
 
 @app.get("/")
-def root():
+def home():
     return {"message": "API is working"}
-
-
-pinecone.init(api_key=os.getenv("PINECONE_API_KEY"), environment=os.getenv("PINECONE_ENV"))
-INDEX_NAME = "teacher_rag"
-if INDEX_NAME not in pinecone.list_indexes():
-    pinecone.create_index(INDEX_NAME, dimension=1536)
-
-index = pinecone.Index(INDEX_NAME)
-embedding_fn = OpenAIEmbeddings()
-
-vision_client = vision.ImageAnnotatorClient()
-
-def ocr_image(file_bytes: bytes) -> str:
-    image = vision.Image(content=file_bytes)
-    response = vision_client.document_text_detection(image=image)
-    return response.full_text_annotation.text or ""
-
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    from pdfminer.high_level import extract_text_to_fp
-    import io
-    out = io.StringIO()
-    extract_text_to_fp(io.BytesIO(file_bytes), out)
-    return out.getvalue()
-
-def extract_text_from_ppt(file_bytes: bytes) -> str:
-    from pptx import Presentation
-    import io
-    prs = Presentation(io.BytesIO(file_bytes))
-    text = ""
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            if hasattr(shape, "text"):
-                text += shape.text + "\n"
-    return text
-
-@app.post("/upload-documents")
-async def upload_documents(
-    class_name: str = Form(...),
-    subject: str = Form(...),
-    curriculum: str = Form(...),
-    teacher_id: str = Form(...),
-    files: List[UploadFile] = File(...)
-):
-    all_chunks = []
-    metadata_list = []
-    for file in files:
-        content = await file.read()
-        ext = os.path.splitext(file.filename)[1].lower()
-        if ext in [".pdf"]:
-            text = extract_text_from_pdf(content)
-        elif ext in [".pptx", ".ppt"]:
-            text = extract_text_from_ppt(content)
-        elif ext in [".jpg", ".jpeg", ".png"]:
-            text = ocr_image(content)
-        else:
-            continue
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = splitter.split_text(text)
-        for chunk in chunks:
-            metadata_list.append({
-                "teacher_id": teacher_id,
-                "class": class_name,
-                "subject": subject,
-                "curriculum": curriculum,
-                "source": file.filename
-            })
-            all_chunks.append(chunk)
-    if not all_chunks:
-        raise HTTPException(400, "No valid content extracted")
-    embeddings = embedding_fn.embed_documents(all_chunks)
-    Pinecone.from_texts(all_chunks, embedding_fn,
-                       index_name=INDEX_NAME, metadatas=metadata_list)
-    return {"message": f"Indexed {len(all_chunks)} chunks for teacher {teacher_id}"}
-
-
-
-@app.post("/rag-chat")
-async def rag_chat(
-    question: str,
-    teacher_id: str = Form(...),
-    class_name: str = Form(None),
-    subject: str = Form(None)
-):
-    filter_meta = {"teacher_id": teacher_id}
-    if class_name: filter_meta["class"] = class_name
-    if subject: filter_meta["subject"] = subject
-
-    vectordb = Pinecone.from_existing_index(index_name=INDEX_NAME,
-                                             embedding=embedding_fn,
-                                             filter=filter_meta)
-    llm = OpenAI(temperature=0, model="gpt-3.5-turbo")
-    qa = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=vectordb.as_retriever())
-    answer = qa.run(question)
-    return {"answer": answer}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8888, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

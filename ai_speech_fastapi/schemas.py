@@ -14,8 +14,10 @@ class UserCreate(BaseModel):
 
 
 class UserOut(BaseModel):
-    user_id: int
+    id: int
     username: str
+    class Config:
+        from_attributes = True
 
 
 class UserUpdate(BaseModel):
